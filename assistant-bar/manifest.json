@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.hermes.assistant",
+  "name": "Assistant state",
+  "version": "1.0.0",
+  "author": "Hermes",
+  "description": "Shows the voice assistant's state in the bar: listening, thinking, or speaking",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Assistant",
+    "description": "Listening / thinking / speaking indicator for the local voice assistant",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

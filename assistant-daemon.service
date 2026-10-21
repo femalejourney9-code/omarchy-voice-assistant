@@ -1,0 +1,22 @@
+[Unit]
+Description=Local voice assistant wake-word daemon
+Documentation=file:///home/kali/assistant/README.md
+After=pipewire.service sound.target
+Wants=pipewire.service
+# Restart limits live in [Unit], not [Service].
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# The dispatcher's own daemon loop runs the wake-word helper.
+ExecStart=%h/bin/assistant daemon
+Restart=always
+RestartSec=5
+
+# Log to both the journal and the assistant's own rotated logfile.
+StandardOutput=append:%h/.local/state/assistant/assistant.log
+StandardError=append:%h/.local/state/assistant/assistant.log
+
+[Install]
+WantedBy=default.target

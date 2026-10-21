@@ -1,0 +1,701 @@
+#!/usr/bin/env bash
+#
+# assistant — local push-to-talk voice assistant for Omarchy.
+#
+#   HEAR  : mic capture (sox) + VAD-ish silence trim
+#   THINK : whisper.cpp STT -> Ollama LLM
+#   SPEAK : Piper TTS -> PipeWire playback
+#
+# Subcommands:
+#   listen   push-to-talk: record one utterance, then run the core loop
+#   once     the core loop: record -> transcribe -> LLM -> speak
+#   daemon   always-on wake-word loop ("hey jarvis"), runs `once` on wake
+#   install  run setup.sh (idempotent)
+#   doctor   print a status table and exit non-zero if anything is missing
+#   speak    speak the given text (test the TTS stage only)
+#   transcribe  transcribe the given wav file (test the STT stage only)
+#
+# Every stage is its own function so you can swap one without touching others.
+# Everything is local: no cloud, no Docker, no telemetry.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Paths and config
+# ---------------------------------------------------------------------------
+
+readonly SELF="${BASH_SOURCE[0]}"
+readonly ASSISTANT_HOME="${HOME}/assistant"
+readonly SETUP_SCRIPT="${ASSISTANT_HOME}/setup.sh"
+readonly CONF_FILE="${HOME}/.config/assistant/assistant.conf"
+
+# Defaults, used if the config file is missing or omits a key.
+ASSISTANT_MODEL="${ASSISTANT_MODEL:-llama3.2:3b}"
+ASSISTANT_WHISPER_MODEL="${ASSISTANT_WHISPER_MODEL:-base.en}"
+ASSISTANT_PIPER_VOICE="${ASSISTANT_PIPER_VOICE:-en_US-lessac-medium}"
+ASSISTANT_WAKE_WORD="${ASSISTANT_WAKE_WORD:-hey jarvis}"
+ASSISTANT_WAKE_WORD_ENABLED="${ASSISTANT_WAKE_WORD_ENABLED:-1}"
+ASSISTANT_SILENCE_TIMEOUT="${ASSISTANT_SILENCE_TIMEOUT:-1.2}"
+ASSISTANT_SILENCE_DB="${ASSISTANT_SILENCE_DB:--35}"
+ASSISTANT_RECORD_CAP="${ASSISTANT_RECORD_CAP:-30}"
+ASSISTANT_LISTEN_CAP="${ASSISTANT_LISTEN_CAP:-20}"
+ASSISTANT_STATE_DIR="${ASSISTANT_STATE_DIR:-${HOME}/.local/state/assistant}"
+ASSISTANT_LOG_FILE="${ASSISTANT_LOG_FILE:-${ASSISTANT_STATE_DIR}/assistant.log}"
+ASSISTANT_BAR_STATE="${ASSISTANT_BAR_STATE:-${ASSISTANT_STATE_DIR}/state}"
+ASSISTANT_VOICE_DIR="${ASSISTANT_VOICE_DIR:-${HOME}/.local/share/assistant/voices}"
+ASSISTANT_MODEL_DIR="${ASSISTANT_MODEL_DIR:-${HOME}/.local/share/assistant/whisper}"
+ASSISTANT_VENV_DIR="${ASSISTANT_VENV_DIR:-${HOME}/.venv/oww}"
+ASSISTANT_WAKEWORD_PY="${ASSISTANT_WAKEWORD_PY:-${ASSISTANT_HOME}/wakeword.py}"
+ASSISTANT_WAKEWORD_TRIGGER="${ASSISTANT_WAKEWORD_TRIGGER:-${ASSISTANT_STATE_DIR}/wake}"
+ASSISTANT_NOTIFY_TIMEOUT="${ASSISTANT_NOTIFY_TIMEOUT:-8000}"
+ASSISTANT_LLM_TIMEOUT="${ASSISTANT_LLM_TIMEOUT:-120}"
+ASSISTANT_STT_TIMEOUT="${ASSISTANT_STT_TIMEOUT:-60}"
+ASSISTANT_TTS_TIMEOUT="${ASSISTANT_TTS_TIMEOUT:-30}"
+
+# Load the user config over the defaults.
+if [[ -f "${CONF_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${CONF_FILE}"
+fi
+
+# Tool locations, overridable via config for non-standard installs.
+WHISPER_BIN="${ASSISTANT_WHISPER_BIN:-}"
+PIPER_BIN="${ASSISTANT_PIPER_BIN:-}"
+OLLAMA_BIN="${ASSISTANT_OLLAMA_BIN:-ollama}"
+
+# ---------------------------------------------------------------------------
+# Derived paths
+# ---------------------------------------------------------------------------
+
+whisper_model_path() {
+    # ggml-base.en.bin style name, matching the whisper.cpp repo layout.
+    echo "${ASSISTANT_MODEL_DIR}/ggml-${ASSISTANT_WHISPER_MODEL}.bin"
+}
+
+piper_voice_path() {
+    # Piper voices are a pair: <name>.onnx and <name>.onnx.json
+    echo "${ASSISTANT_VOICE_DIR}/${ASSISTANT_PIPER_VOICE}.onnx"
+}
+
+record_file() {
+    echo "${ASSISTANT_STATE_DIR}/rec.wav"
+}
+
+trimmed_file() {
+    echo "${ASSISTANT_STATE_DIR}/trim.wav"
+}
+
+tts_file() {
+    echo "${ASSISTANT_STATE_DIR}/speak.wav"
+}
+
+# ---------------------------------------------------------------------------
+# Logging (rotated, simple)
+# ---------------------------------------------------------------------------
+
+LOG_MAX_BYTES=$((5 * 1024 * 1024))   # 5 MB
+LOG_KEEP=3
+
+log_rotate() {
+    local log="$1"
+    [[ -f "${log}" ]] || return 0
+    local size
+    size="$(stat -c '%s' "${log}" 2>/dev/null || echo 0)"
+    if (( size > LOG_MAX_BYTES )); then
+        local i
+        for (( i = LOG_KEEP - 1; i >= 1; i-- )); do
+            if [[ -f "${log}.${i}" ]]; then
+                mv "${log}.${i}" "$(( i + 1 ))" 2>/dev/null || true
+            fi
+        done
+        mv "${log}" "${log}.1"
+    fi
+}
+
+log() {
+    local level="$1"
+    shift
+    local msg="$*"
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    mkdir -p "${ASSISTANT_STATE_DIR}"
+    log_rotate "${ASSISTANT_LOG_FILE}"
+    printf '%s [%s] %s\n' "${ts}" "${level}" "${msg}" >> "${ASSISTANT_LOG_FILE}"
+    # Also to journal when running under systemd.
+    printf '[%s] %s\n' "${level}" "${msg}"
+}
+
+die() {
+    log ERROR "$*"
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Bar state (read by the Omarchy bar widget)
+# ---------------------------------------------------------------------------
+
+set_state() {
+    local state="$1"
+    mkdir -p "${ASSISTANT_STATE_DIR}"
+    printf '%s\n' "${state}" > "${ASSISTANT_BAR_STATE}"
+    log DEBUG "state -> ${state}"
+}
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+
+notify() {
+    local title="$1"
+    local body="${2:-}"
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -t "${ASSISTANT_NOTIFY_TIMEOUT}" "${title}" "${body}" 2>/dev/null || true
+    else
+        log WARN "notify-send not found; skipping notification: ${title}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Stage 1: HEAR — record and trim
+# ---------------------------------------------------------------------------
+
+require_tools() {
+    local missing=()
+    local t
+    for t in sox jq curl; do
+        command -v "${t}" >/dev/null 2>&1 || missing+=("${t}")
+    done
+    if (( ${#missing[@]} > 0 )); then
+        die "missing required tools: ${missing[*]}"
+    fi
+}
+
+record_audio() {
+    # record_audio <output.wav> <cap_seconds>
+    # Records from the default PulseAudio/PipeWire source, then trims leading and
+    # trailing silence with sox. Sox also gives us the auto-stop on silence.
+    local out="$1"
+    local cap="$2"
+
+    require_tools
+
+    local source
+    source="$(default_source)"
+    if [[ -z "${source}" ]]; then
+        die "no PulseAudio/PipeWire source found"
+    fi
+    log INFO "recording from source: ${source} (cap ${cap}s)"
+
+    mkdir -p "${ASSISTANT_STATE_DIR}"
+
+    # sox: -d = default capture device, silence detection stops the recording.
+    # The first silence clause means "start recording immediately" (1 period of
+    # silence below threshold for 0.1s is fine to begin), the second means
+    # "stop after 1 period of 1.2s silence below -35 dB".
+    if ! timeout "${cap}" \
+        sox -d \
+            -r 16000 -c 1 -b 16 -e signed-integer \
+            "${out}" \
+            silence 1 0.1 "${ASSISTANT_SILENCE_DB}" 1 \
+                   1 "${ASSISTANT_SILENCE_TIMEOUT}" "${ASSISTANT_SILENCE_DB}" 1 \
+        2>> "${ASSISTANT_LOG_FILE}"; then
+        local code=$?
+        if (( code == 124 )); then
+            log WARN "recording hit the ${cap}s cap"
+        else
+            die "sox recording failed (exit ${code})"
+        fi
+    fi
+
+    if [[ ! -s "${out}" ]]; then
+        die "recording produced no audio"
+    fi
+    log INFO "recorded $(stat -c '%s' "${out}") bytes"
+}
+
+trim_silence() {
+    # trim_silence <in.wav> <out.wav>
+    # Removes leading and trailing silence so whisper doesn't wait on dead air.
+    local in="$1"
+    local out="$2"
+    local silence
+    silence="${ASSISTANT_SILENCE_DB}"
+
+    # Strip leading silence.
+    if ! sox "${in}" "${out}" \
+            silence 1 0.1 "${silence}" 1 \
+        2>> "${ASSISTANT_LOG_FILE}"; then
+        log WARN "leading-silence trim failed; using the raw recording"
+        cp "${in}" "${out}"
+        return 0
+    fi
+
+    # Strip trailing silence.
+    if ! sox "${out}" "${out}.t" reverse \
+            silence 1 0.1 "${silence}" 1 \
+            reverse \
+        2>> "${ASSISTANT_LOG_FILE}"; then
+        log WARN "trailing-silence trim failed; keeping the leading-trimmed file"
+        return 0
+    fi
+    mv "${out}.t" "${out}"
+    log INFO "trimmed to $(stat -c '%s' "${out}") bytes"
+}
+
+default_source() {
+    # The default PulseAudio/PipeWire source name, or empty if none.
+    pactl info 2>/dev/null | sed -n 's/^Default Source: //p' | head -1
+}
+
+# ---------------------------------------------------------------------------
+# Stage 2: THINK — STT then LLM
+# ---------------------------------------------------------------------------
+
+whisper_bin() {
+    if [[ -n "${WHISPER_BIN}" ]]; then
+        echo "${WHISPER_BIN}"
+        return 0
+    fi
+    local candidate
+    for candidate in whisper-cpp whisper-cpp-cli whisper; do
+        if command -v "${candidate}" >/dev/null 2>&1; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+    echo ""
+}
+
+transcribe() {
+    # transcribe <wav>  -> prints the transcription to stdout
+    local wav="$1"
+
+    local bin
+    bin="$(whisper_bin)"
+    [[ -n "${bin}" ]] || die "whisper.cpp binary not found"
+
+    local model
+    model="$(whisper_model_path)"
+    [[ -f "${model}" ]] || die "whisper model not found: ${model}"
+
+    [[ -f "${wav}" ]] || die "no audio to transcribe: ${wav}"
+
+    log INFO "transcribing ${wav} with ${bin} (${ASSISTANT_WHISPER_MODEL})"
+
+    local text=""
+    # -nt : no timestamps. -np : no print. -oj : JSON out (easy to parse).
+    if ! text="$(timeout "${ASSISTANT_STT_TIMEOUT}" \
+        "${bin}" \
+            -m "${model}" \
+            -f "${wav}" \
+            -nt -np -oj 2>> "${ASSISTANT_LOG_FILE}" \
+        | jq -r '(.transcriptions[0].text // "") | gsub("\\s+"; " ") | .[0:]' 2>/dev/null)"; then
+        die "whisper.cpp failed"
+    fi
+
+    text="$(printf '%s' "${text}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    log INFO "transcription: ${text}"
+    printf '%s\n' "${text}"
+}
+
+ask_llm() {
+    # ask_llm <prompt>  -> prints the answer to stdout
+    local prompt="$1"
+
+    if ! command -v "${OLLAMA_BIN}" >/dev/null 2>&1; then
+        die "ollama not found"
+    fi
+    if ! curl -fsS --max-time 5 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+        die "ollama is not running (start it with: systemctl --user start ollama)"
+    fi
+
+    log INFO "asking ollama (${ASSISTANT_MODEL})"
+
+    local payload response answer
+    # num_predict is a hard cap on reply length. A voice assistant wants short
+    # answers, and on CPU inference (this box has no CUDA/ROCm) 256 tokens can
+    # take over two minutes — long enough to look hung. 96 tokens is ~2
+    # sentences, which is plenty for a spoken reply.
+    payload="$(jq -n \
+        --arg model "${ASSISTANT_MODEL}" \
+        --arg prompt "${prompt}" \
+        '{model: $model, prompt: $prompt, stream: false,
+          options: {temperature: 0.2, num_predict: 96}}')"
+
+    if ! response="$(timeout "${ASSISTANT_LLM_TIMEOUT}" \
+        curl -fsS --max-time "${ASSISTANT_LLM_TIMEOUT}" \
+            -X POST http://127.0.0.1:11434/api/generate \
+            -H 'Content-Type: application/json' \
+            -d "${payload}" 2>> "${ASSISTANT_LOG_FILE}")"; then
+        die "ollama request failed"
+    fi
+
+    answer="$(printf '%s' "${response}" | jq -r '.response // ""' 2>/dev/null || echo "")"
+    answer="$(printf '%s' "${answer}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+
+    if [[ -z "${answer}" ]]; then
+        die "ollama returned an empty answer"
+    fi
+    log INFO "llm answer: ${answer}"
+    printf '%s\n' "${answer}"
+}
+
+# ---------------------------------------------------------------------------
+# Stage 3: SPEAK — TTS then PipeWire playback
+# ---------------------------------------------------------------------------
+
+piper_bin() {
+    if [[ -n "${PIPER_BIN}" ]]; then
+        echo "${PIPER_BIN}"
+        return 0
+    fi
+    local candidate
+    for candidate in piper piper-tts; do
+        if command -v "${candidate}" >/dev/null 2>&1; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+    echo ""
+}
+
+playback_cmd() {
+    # Prefer paplay (PulseAudio-compatible, always present on PipeWire);
+    # fall back to pw-play.
+    if command -v paplay >/dev/null 2>&1; then
+        echo "paplay"
+    elif command -v pw-play >/dev/null 2>&1; then
+        echo "pw-play"
+    else
+        echo ""
+    fi
+}
+
+speak() {
+    # speak <text>
+    local text="$1"
+    [[ -n "${text}" ]] || { log WARN "nothing to speak"; return 0; }
+
+    local bin
+    bin="$(piper_bin)"
+    [[ -n "${bin}" ]] || die "piper binary not found"
+
+    local voice
+    voice="$(piper_voice_path)"
+    [[ -f "${voice}" ]] || die "piper voice not found: ${voice}"
+
+    local out
+    out="$(tts_file)"
+
+    log INFO "synthesizing speech (${ASSISTANT_PIPER_VOICE})"
+
+    # Piper reads text on stdin and writes a wav to --output_file. A plain pipe
+    # keeps the argument mapping obvious; an inline `bash -c` here is easy to
+    # get off-by-one and silently pass an empty output path.
+    if ! printf '%s' "${text}" \
+        | timeout "${ASSISTANT_TTS_TIMEOUT}" \
+            "${bin}" --model "${voice}" --output_file "${out}" \
+        2>> "${ASSISTANT_LOG_FILE}"; then
+        die "piper synthesis failed"
+    fi
+    [[ -s "${out}" ]] || die "piper produced no audio"
+
+    local play
+    play="$(playback_cmd)"
+    [[ -n "${play}" ]] || die "no playback tool found (want paplay or pw-play)"
+
+    log INFO "playing ${out} via ${play}"
+    "${play}" "${out}" 2>> "${ASSISTANT_LOG_FILE}" || die "playback failed"
+}
+
+# ---------------------------------------------------------------------------
+# The core loop
+# ---------------------------------------------------------------------------
+
+run_once() {
+    # run_once <cap_seconds> <label>
+    local cap="$1"
+    local label="${2:-once}"
+
+    local rec trim text answer
+
+    set_state listening
+    notify "Listening" "${label}: speak now"
+
+    rec="$(record_file)"
+    trim="$(trimmed_file)"
+
+    record_audio "${rec}" "${cap}"
+    trim_silence "${rec}" "${trim}"
+
+    set_state thinking
+    text="$(transcribe "${trim}")"
+
+    if [[ -z "${text}" ]]; then
+        log WARN "empty transcription; nothing to ask"
+        notify "You said: …" "(nothing detected)"
+        set_state idle
+        return 0
+    fi
+
+    notify "You said: ${text}" ""
+
+    answer="$(ask_llm "${text}")"
+    notify "Assistant: ${answer}" ""
+
+    set_state speaking
+    speak "${answer}"
+
+    set_state idle
+    log INFO "${label} complete"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+cmd_listen() {
+    run_once "${ASSISTANT_LISTEN_CAP}" "push to talk"
+}
+
+cmd_once() {
+    run_once "${ASSISTANT_RECORD_CAP}" "once"
+}
+
+cmd_speak() {
+    local text="${1:-}"
+    [[ -n "${text}" ]] || die "usage: assistant speak <text>"
+    speak "${text}"
+}
+
+cmd_transcribe() {
+    local wav="${1:-}"
+    [[ -n "${wav}" ]] || die "usage: assistant transcribe <file.wav>"
+    transcribe "${wav}"
+}
+
+cmd_daemon() {
+    if [[ "${ASSISTANT_WAKE_WORD_ENABLED}" != "1" ]]; then
+        die "wake word disabled (ASSISTANT_WAKE_WORD_ENABLED=0)"
+    fi
+    local py="${ASSISTANT_VENV_DIR}/bin/python"
+    [[ -x "${py}" ]] || die "wake-word venv missing: ${ASSISTANT_VENV_DIR}"
+    [[ -f "${ASSISTANT_WAKEWORD_PY}" ]] || die "wake-word script missing: ${ASSISTANT_WAKEWORD_PY}"
+
+    log INFO "wake-word daemon starting (wake word: ${ASSISTANT_WAKE_WORD})"
+    rm -f "${ASSISTANT_WAKEWORD_TRIGGER}"
+
+    # The Python helper writes the trigger file when it hears the wake word.
+    while true; do
+        rm -f "${ASSISTANT_WAKEWORD_TRIGGER}"
+        set_state listening
+        "${py}" "${ASSISTANT_WAKEWORD_PY}" \
+            --wake-word "${ASSISTANT_WAKE_WORD}" \
+            --trigger "${ASSISTANT_WAKEWORD_TRIGGER}" \
+            >> "${ASSISTANT_LOG_FILE}" 2>&1 || {
+                log ERROR "wake-word helper exited; retrying in 5s"
+                sleep 5
+                continue
+            }
+
+        if [[ -f "${ASSISTANT_WAKEWORD_TRIGGER}" ]]; then
+            log INFO "wake word detected"
+            # Push-to-talk style: listen for the follow-up utterance.
+            run_once "${ASSISTANT_LISTEN_CAP}" "wake"
+        fi
+        sleep 0.5
+    done
+}
+
+cmd_install() {
+    [[ -f "${SETUP_SCRIPT}" ]] || die "setup script not found: ${SETUP_SCRIPT}"
+    exec bash "${SETUP_SCRIPT}"
+}
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+
+doctor_row() {
+    # doctor_row <label> <status: OK|FAIL|WARN> <detail>
+    local label="$1" status="$2" detail="$3"
+    printf '%-22s %-5s %s\n' "${label}" "${status}" "${detail}"
+}
+
+cmd_doctor() {
+    local fails=0
+    local status detail
+
+    echo "assistant doctor"
+    echo "================"
+
+    # --- mic ---
+    detail="$(default_source)"
+    if [[ -n "${detail}" ]]; then
+        doctor_row "mic source" "OK" "${detail}"
+    else
+        doctor_row "mic source" "FAIL" "no default PulseAudio source"
+        fails=$(( fails + 1 ))
+    fi
+
+    if command -v sox >/dev/null 2>&1; then
+        doctor_row "sox" "OK" "$(command -v sox)"
+    else
+        doctor_row "sox" "FAIL" "not installed"
+        fails=$(( fails + 1 ))
+    fi
+
+    # --- speaker ---
+    detail="$(pactl info 2>/dev/null | sed -n 's/^Default Sink: //p' | head -1)"
+    if [[ -n "${detail}" ]]; then
+        doctor_row "speaker sink" "OK" "${detail}"
+    else
+        doctor_row "speaker sink" "FAIL" "no default sink"
+        fails=$(( fails + 1 ))
+    fi
+
+    local play
+    play="$(playback_cmd)"
+    if [[ -n "${play}" ]]; then
+        doctor_row "playback tool" "OK" "${play}"
+    else
+        doctor_row "playback tool" "FAIL" "want paplay or pw-play"
+        fails=$(( fails + 1 ))
+    fi
+
+    # --- whisper ---
+    local wbin
+    wbin="$(whisper_bin)"
+    if [[ -n "${wbin}" ]]; then
+        doctor_row "whisper binary" "OK" "${wbin}"
+    else
+        doctor_row "whisper binary" "FAIL" "not found (whisper-cpp)"
+        fails=$(( fails + 1 ))
+    fi
+
+    local wmodel
+    wmodel="$(whisper_model_path)"
+    if [[ -f "${wmodel}" ]]; then
+        doctor_row "whisper model" "OK" "${wmodel}"
+    else
+        doctor_row "whisper model" "FAIL" "${wmodel}"
+        fails=$(( fails + 1 ))
+    fi
+
+    # --- piper ---
+    local pbin
+    pbin="$(piper_bin)"
+    if [[ -n "${pbin}" ]]; then
+        doctor_row "piper binary" "OK" "${pbin}"
+    else
+        doctor_row "piper binary" "FAIL" "not found"
+        fails=$(( fails + 1 ))
+    fi
+
+    local pvoice
+    pvoice="$(piper_voice_path)"
+    if [[ -f "${pvoice}" ]]; then
+        doctor_row "piper voice" "OK" "${pvoice}"
+    else
+        doctor_row "piper voice" "FAIL" "${pvoice}"
+        fails=$(( fails + 1 ))
+    fi
+
+    # --- ollama ---
+    if command -v "${OLLAMA_BIN}" >/dev/null 2>&1; then
+        doctor_row "ollama binary" "OK" "$(command -v "${OLLAMA_BIN}")"
+    else
+        doctor_row "ollama binary" "FAIL" "not found"
+        fails=$(( fails + 1 ))
+    fi
+
+    if curl -fsS --max-time 5 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+        doctor_row "ollama server" "OK" "reachable on 127.0.0.1:11434"
+    else
+        doctor_row "ollama server" "FAIL" "not running (systemctl --user start ollama)"
+        fails=$(( fails + 1 ))
+    fi
+
+    if curl -fsS --max-time 5 http://127.0.0.1:11434/api/tags 2>/dev/null \
+        | jq -e --arg m "${ASSISTANT_MODEL}" \
+            '(.models // []) | map(.name) | index($m)' >/dev/null 2>&1; then
+        doctor_row "ollama model" "OK" "${ASSISTANT_MODEL} is pulled"
+    else
+        doctor_row "ollama model" "WARN" "${ASSISTANT_MODEL} not pulled (ollama pull ${ASSISTANT_MODEL})"
+    fi
+
+    # --- wake word ---
+    if [[ "${ASSISTANT_WAKE_WORD_ENABLED}" == "1" ]]; then
+        if [[ -x "${ASSISTANT_VENV_DIR}/bin/python" ]]; then
+            doctor_row "wake-word venv" "OK" "${ASSISTANT_VENV_DIR}"
+        else
+            doctor_row "wake-word venv" "FAIL" "${ASSISTANT_VENV_DIR} missing"
+            fails=$(( fails + 1 ))
+        fi
+        if [[ -f "${ASSISTANT_WAKEWORD_PY}" ]]; then
+            doctor_row "wake-word script" "OK" "${ASSISTANT_WAKEWORD_PY}"
+        else
+            doctor_row "wake-word script" "FAIL" "${ASSISTANT_WAKEWORD_PY}"
+            fails=$(( fails + 1 ))
+        fi
+    else
+        doctor_row "wake word" "WARN" "disabled"
+    fi
+
+    # --- log ---
+    doctor_row "log file" "OK" "${ASSISTANT_LOG_FILE}"
+
+    echo
+    if (( fails == 0 )); then
+        echo "All checks passed."
+        return 0
+    fi
+    echo "${fails} check(s) failed. Run: assistant install"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+usage: assistant <command>
+
+  listen      push-to-talk: record one utterance, then the core loop
+  once        the core loop: record -> transcribe -> LLM -> speak
+  daemon      always-on wake-word loop ("hey jarvis"), runs `once` on wake
+  install     run setup.sh (idempotent)
+  doctor      print a status table; exit non-zero if anything is missing
+  speak       speak the given text (tests TTS only)
+  transcribe  transcribe the given wav file (tests STT only)
+
+Environment:
+  ASSISTANT_MODEL        LLM model (default llama3.2:3b)
+  ASSISTANT_SILENCE_TIMEOUT  trailing silence before stop, seconds (default 1.2)
+
+Config file: ~/.config/assistant/assistant.conf
+EOF
+}
+
+main() {
+    local cmd="${1:-}"
+    [[ -n "${cmd}" ]] || { usage; exit 2; }
+    shift || true
+
+    mkdir -p "${ASSISTANT_STATE_DIR}"
+
+    case "${cmd}" in
+        listen)     cmd_listen ;;
+        once)       cmd_once ;;
+        daemon)     cmd_daemon ;;
+        install)    cmd_install ;;
+        doctor)     cmd_doctor ;;
+        speak)      cmd_speak "$@" ;;
+        transcribe) cmd_transcribe "$@" ;;
+        help|-h|--help) usage ;;
+        *)          printf 'unknown command: %s\n\n' "${cmd}" >&2; usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"

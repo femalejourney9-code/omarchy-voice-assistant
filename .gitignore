@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local state: recordings, generated speech, logs, bar-state file
+.local/
+*.wav
+
+# Backups created by installers
+*.bak
+*.bak.*
+
+# Editor / OS noise
+*.swp
+.DS_Store
