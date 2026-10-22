@@ -93,6 +93,29 @@ This machine has 8 GB, so `base.en` is the default.
 - `qwen2.5:3b` — good alternative
 - anything larger will be slow or not fit
 
+### Performance on this hardware
+
+Measured on this box (Intel HD 620, CPU-only inference, no CUDA/ROCm):
+
+| Reply cap | Time |
+| --- | --- |
+| 32 tokens | ~25 s |
+| 96 tokens | ~58 s |
+| 128 tokens | ~61 s |
+
+That is roughly **0.8 s per token**. `ASSISTANT_LLM_NUM_PREDICT` defaults to `32` because it is the single biggest latency lever — a spoken answer needs far less than 96 tokens.
+
+Two things make real-world latency worse than the table:
+
+- **The machine was under load during measurement** (load average 15+). The same 32-token request took 56 s loaded versus 25 s idle. Expect variance.
+- **The wake-word daemon costs ~28% CPU continuously** while it listens. On an already-busy machine that directly competes with the LLM.
+
+If latency matters more than the wake word, either lower `ASSISTANT_LLM_NUM_PREDICT`, switch to `llama3.2:1b`, or stop the daemon and use `SUPER + V` push-to-talk:
+
+```bash
+systemctl --user stop assistant-daemon   # frees ~28% CPU
+```
+
 ### Which Piper voice?
 
 The full list is at <https://rhasspy.github.io/piper-samples/>. The installer only downloads the one you configure, so to add another, download the `.onnx` and `.onnx.json` pair into `~/.local/share/assistant/voices/` and point `ASSISTANT_PIPER_VOICE` at the basename.

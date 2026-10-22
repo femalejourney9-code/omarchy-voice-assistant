@@ -48,7 +48,8 @@ ASSISTANT_VENV_DIR="${ASSISTANT_VENV_DIR:-${HOME}/.venv/oww}"
 ASSISTANT_WAKEWORD_PY="${ASSISTANT_WAKEWORD_PY:-${ASSISTANT_HOME}/wakeword.py}"
 ASSISTANT_WAKEWORD_TRIGGER="${ASSISTANT_WAKEWORD_TRIGGER:-${ASSISTANT_STATE_DIR}/wake}"
 ASSISTANT_NOTIFY_TIMEOUT="${ASSISTANT_NOTIFY_TIMEOUT:-8000}"
-ASSISTANT_LLM_TIMEOUT="${ASSISTANT_LLM_TIMEOUT:-120}"
+ASSISTANT_LLM_TIMEOUT="${ASSISTANT_LLM_TIMEOUT:-300}"
+ASSISTANT_LLM_NUM_PREDICT="${ASSISTANT_LLM_NUM_PREDICT:-32}"
 ASSISTANT_STT_TIMEOUT="${ASSISTANT_STT_TIMEOUT:-60}"
 ASSISTANT_TTS_TIMEOUT="${ASSISTANT_TTS_TIMEOUT:-30}"
 
@@ -312,15 +313,16 @@ ask_llm() {
     log INFO "asking ollama (${ASSISTANT_MODEL})"
 
     local payload response answer
-    # num_predict is a hard cap on reply length. A voice assistant wants short
-    # answers, and on CPU inference (this box has no CUDA/ROCm) 256 tokens can
-    # take over two minutes — long enough to look hung. 96 tokens is ~2
-    # sentences, which is plenty for a spoken reply.
+    # num_predict caps reply length. On CPU-only inference this box runs at
+    # roughly 0.8 s/token, so 96 tokens took 58 s clean and 176 s under load.
+    # A spoken answer needs far less; 32 tokens is the default and this is the
+    # single biggest latency lever.
     payload="$(jq -n \
         --arg model "${ASSISTANT_MODEL}" \
         --arg prompt "${prompt}" \
+        --argjson cap "${ASSISTANT_LLM_NUM_PREDICT}" \
         '{model: $model, prompt: $prompt, stream: false,
-          options: {temperature: 0.2, num_predict: 96}}')"
+          options: {temperature: 0.2, num_predict: $cap}}')"
 
     if ! response="$(timeout "${ASSISTANT_LLM_TIMEOUT}" \
         curl -fsS --max-time "${ASSISTANT_LLM_TIMEOUT}" \
